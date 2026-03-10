@@ -1,0 +1,502 @@
+import Foundation
+import MLX
+import MLXNN
+
+// MARK: - HDemucs Runtime Config
+
+struct HDemucsRuntimeConfig {
+    let sources: [String]
+    let audioChannels: Int
+    let channels: Int
+    let channelsTime: Int?
+    let growth: Int
+    let nFFT: Int
+    let wienerIters: Int
+    let cac: Bool
+    let depth: Int
+    let rewrite: Bool
+    let hybrid: Bool
+    let freqEmb: Float
+    let embScale: Float
+    let embSmooth: Bool
+    let kernelSize: Int
+    let timeStride: Int
+    let stride: Int
+    let context: Int
+    let contextEnc: Int
+    let normStarts: Int
+    let normGroups: Int
+    let dconvMode: Int
+    let dconvDepth: Int
+    let dconvComp: Float
+    let dconvAttn: Int
+    let dconvLstm: Int
+    let dconvInit: Float
+    let samplerate: Int
+    let segment: Float
+
+    static func fromJSON(_ json: [String: Any]) throws -> HDemucsRuntimeConfig {
+        let kwargs = json["kwargs"] as? [String: Any] ?? json
+        let i = ModelLoader.int
+        let b = ModelLoader.bool
+        let d = ModelLoader.double
+
+        return HDemucsRuntimeConfig(
+            sources: ModelLoader.sources(kwargs),
+            audioChannels: i(kwargs, "audio_channels", 2),
+            channels: i(kwargs, "channels", 48),
+            channelsTime: kwargs["channels_time"] as? Int,
+            growth: i(kwargs, "growth", 2),
+            nFFT: i(kwargs, "nfft", 4096),
+            wienerIters: i(kwargs, "wiener_iters", 0),
+            cac: b(kwargs, "cac", true),
+            depth: i(kwargs, "depth", 6),
+            rewrite: b(kwargs, "rewrite", true),
+            hybrid: b(kwargs, "hybrid", true),
+            freqEmb: Float(d(kwargs, "freq_emb", 0.2)),
+            embScale: Float(d(kwargs, "emb_scale", 10.0)),
+            embSmooth: b(kwargs, "emb_smooth", true),
+            kernelSize: i(kwargs, "kernel_size", 8),
+            timeStride: i(kwargs, "time_stride", 2),
+            stride: i(kwargs, "stride", 4),
+            context: i(kwargs, "context", 1),
+            contextEnc: i(kwargs, "context_enc", 0),
+            normStarts: i(kwargs, "norm_starts", 4),
+            normGroups: i(kwargs, "norm_groups", 4),
+            dconvMode: i(kwargs, "dconv_mode", 1),
+            dconvDepth: i(kwargs, "dconv_depth", 2),
+            dconvComp: Float(d(kwargs, "dconv_comp", 4.0)),
+            dconvAttn: i(kwargs, "dconv_attn", 4),
+            dconvLstm: i(kwargs, "dconv_lstm", 4),
+            dconvInit: Float(d(kwargs, "dconv_init", 1e-4)),
+            samplerate: i(kwargs, "samplerate", 44100),
+            segment: Float(d(kwargs, "segment", 40.0))
+        )
+    }
+}
+
+// MARK: - HDemucs Graph (v3 Hybrid, no transformer)
+
+final class HDemucsGraph: Module {
+    let config: HDemucsRuntimeConfig
+    let hopLength: Int
+    let freqEmbScale: Float
+
+    @ModuleInfo(key: "encoder") var encoder: [HEncLayer]
+    @ModuleInfo(key: "decoder") var decoder: [HDecLayer]
+    @ModuleInfo(key: "tencoder") var tencoder: [HEncLayer]
+    @ModuleInfo(key: "tdecoder") var tdecoder: [HDecLayer]
+
+    @ModuleInfo(key: "freq_emb") var freqEmb: ScaledEmbedding?
+
+    let spectral: DemucsSpectralPair
+
+    init(config: HDemucsRuntimeConfig) {
+        self.config = config
+        self.hopLength = config.nFFT / 4
+        self.freqEmbScale = config.freqEmb
+
+        var encoders: [HEncLayer] = []
+        var decoders: [HDecLayer] = []
+        var timeEncoders: [HEncLayer] = []
+        var timeDecoders: [HDecLayer] = []
+
+        var chin = config.audioChannels
+        var chinZ = config.cac ? chin * 2 : chin
+        var chout = config.channelsTime ?? config.channels
+        var choutZ = config.channels
+        var freqs = config.nFFT / 2
+
+        for index in 0..<config.depth {
+            let norm = index >= config.normStarts
+            let freq = freqs > 1
+            let lstm = index >= config.dconvLstm
+            let attn = index >= config.dconvAttn
+
+            var currentKernel = config.kernelSize
+            var currentStride = config.stride
+            if !freq {
+                currentKernel = config.timeStride * 2
+                currentStride = config.timeStride
+            }
+
+            var pad = true
+            var lastFreq = false
+            if freq && freqs <= config.kernelSize {
+                currentKernel = freqs
+                pad = false
+                lastFreq = true
+            }
+
+            if lastFreq {
+                choutZ = max(chout, choutZ)
+                chout = choutZ
+            }
+
+            let enc = HEncLayer(
+                inputChannels: chinZ,
+                outputChannels: choutZ,
+                kernelSize: currentKernel,
+                stride: currentStride,
+                normGroups: config.normGroups,
+                empty: false,
+                freq: freq,
+                dconvEnabled: (config.dconvMode & 1) != 0,
+                normEnabled: norm,
+                context: config.contextEnc,
+                dconvDepth: config.dconvDepth,
+                dconvComp: config.dconvComp,
+                dconvInit: config.dconvInit,
+                pad: pad,
+                rewrite: config.rewrite,
+                dconvLstm: lstm,
+                dconvAttn: attn
+            )
+            encoders.append(enc)
+
+            if config.hybrid && freq {
+                let tenc = HEncLayer(
+                    inputChannels: chin,
+                    outputChannels: chout,
+                    kernelSize: config.kernelSize,
+                    stride: config.stride,
+                    normGroups: config.normGroups,
+                    empty: lastFreq,
+                    freq: false,
+                    dconvEnabled: (config.dconvMode & 1) != 0,
+                    normEnabled: norm,
+                    context: config.contextEnc,
+                    dconvDepth: config.dconvDepth,
+                    dconvComp: config.dconvComp,
+                    dconvInit: config.dconvInit,
+                    pad: true,
+                    rewrite: config.rewrite,
+                    dconvLstm: lstm,
+                    dconvAttn: attn
+                )
+                timeEncoders.append(tenc)
+            }
+
+            if index == 0 {
+                chin = config.audioChannels * config.sources.count
+                chinZ = config.cac ? chin * 2 : chin
+            }
+
+            let dec = HDecLayer(
+                inputChannels: choutZ,
+                outputChannels: chinZ,
+                last: index == 0,
+                kernelSize: currentKernel,
+                stride: currentStride,
+                normGroups: config.normGroups,
+                empty: false,
+                freq: freq,
+                dconvEnabled: (config.dconvMode & 2) != 0,
+                normEnabled: norm,
+                context: config.context,
+                dconvDepth: config.dconvDepth,
+                dconvComp: config.dconvComp,
+                dconvInit: config.dconvInit,
+                pad: pad,
+                contextFreq: true,
+                rewrite: config.rewrite,
+                dconvLstm: lstm,
+                dconvAttn: attn
+            )
+            decoders.insert(dec, at: 0)
+
+            if config.hybrid && freq {
+                let tdec = HDecLayer(
+                    inputChannels: chout,
+                    outputChannels: chin,
+                    last: index == 0,
+                    kernelSize: config.kernelSize,
+                    stride: config.stride,
+                    normGroups: config.normGroups,
+                    empty: lastFreq,
+                    freq: false,
+                    dconvEnabled: (config.dconvMode & 2) != 0,
+                    normEnabled: norm,
+                    context: config.context,
+                    dconvDepth: config.dconvDepth,
+                    dconvComp: config.dconvComp,
+                    dconvInit: config.dconvInit,
+                    pad: true,
+                    contextFreq: true,
+                    rewrite: config.rewrite,
+                    dconvLstm: lstm,
+                    dconvAttn: attn
+                )
+                timeDecoders.insert(tdec, at: 0)
+            }
+
+            chin = chout
+            chinZ = choutZ
+            chout *= config.growth
+            choutZ *= config.growth
+
+            if freq {
+                if freqs <= config.kernelSize {
+                    freqs = 1
+                } else {
+                    freqs /= max(1, config.stride)
+                }
+            }
+
+            if index == 0 && config.freqEmb > 0 {
+                self._freqEmb.wrappedValue = ScaledEmbedding(
+                    numEmbeddings: freqs,
+                    embeddingDim: chinZ,
+                    scale: config.embScale
+                )
+            }
+        }
+
+        if config.freqEmb <= 0 {
+            self._freqEmb.wrappedValue = nil
+        }
+
+        self._encoder.wrappedValue = encoders
+        self._decoder.wrappedValue = decoders
+        self._tencoder.wrappedValue = timeEncoders
+        self._tdecoder.wrappedValue = timeDecoders
+
+        self.spectral = DemucsSpectralPair(nFFT: config.nFFT, hopLength: hopLength, center: true)
+
+        super.init()
+    }
+
+    // MARK: - Spectral Helpers
+
+    private func reflectPad1D3D(_ x: MLXArray, left: Int, right: Int) -> MLXArray {
+        let b = x.dim(0)
+        let c = x.dim(1)
+        let t = x.dim(2)
+        let src = x.asArray(Float.self)
+
+        let outT = t + left + right
+        var out = [Float](repeating: 0, count: b * c * outT)
+
+        for bc in 0..<(b * c) {
+            let inBase = bc * t
+            let outBase = bc * outT
+
+            let signal = Array(src[inBase..<(inBase + t)])
+            var padded = [Float]()
+            padded.reserveCapacity(outT)
+
+            if left > 0 {
+                for i in 0..<left {
+                    let idx = max(0, min(signal.count - 1, left - i))
+                    padded.append(signal[idx])
+                }
+            }
+            padded.append(contentsOf: signal)
+            if right > 0 {
+                for i in 0..<right {
+                    let idx = max(0, min(signal.count - 1, signal.count - 2 - i))
+                    padded.append(signal[idx])
+                }
+            }
+
+            out.replaceSubrange(outBase..<(outBase + outT), with: padded)
+        }
+
+        return MLXArray(out).reshaped([b, c, outT])
+    }
+
+    private func spec(_ x: MLXArray) -> DemucsComplexSpectrogram {
+        let hl = hopLength
+        let length = x.dim(-1)
+        let le = Int(ceil(Double(length) / Double(hl)))
+        let pad = (hl / 2) * 3
+
+        let padded = reflectPad1D3D(x, left: pad, right: pad + le * hl - length)
+        var z = spectral.stft(padded)
+
+        z = DemucsComplexSpectrogram(
+            real: z.real[0..., 0..., 0..<(z.real.dim(2) - 1), 0...],
+            imag: z.imag[0..., 0..., 0..<(z.imag.dim(2) - 1), 0...]
+        )
+
+        let start = 2
+        let end = 2 + le
+        return DemucsComplexSpectrogram(
+            real: z.real[0..., 0..., 0..., start..<end],
+            imag: z.imag[0..., 0..., 0..., start..<end]
+        )
+    }
+
+    private func ispec(_ z: DemucsComplexSpectrogram, length: Int) -> MLXArray {
+        let hl = hopLength
+        var real = z.real
+        var imag = z.imag
+
+        if z.real.ndim == 5 {
+            let widths: [IntOrPair] = [0, 0, 0, IntOrPair((0, 1)), IntOrPair((2, 2))]
+            real = MLX.padded(real, widths: widths, mode: .constant)
+            imag = MLX.padded(imag, widths: widths, mode: .constant)
+        } else {
+            let widths: [IntOrPair] = [0, 0, IntOrPair((0, 1)), IntOrPair((2, 2))]
+            real = MLX.padded(real, widths: widths, mode: .constant)
+            imag = MLX.padded(imag, widths: widths, mode: .constant)
+        }
+
+        let pad = (hl / 2) * 3
+        let le = hl * Int(ceil(Double(length) / Double(hl))) + 2 * pad
+
+        var x = spectral.istft(DemucsComplexSpectrogram(real: real, imag: imag), length: le)
+        x = x[0..., 0..., 0..., pad..<(pad + length)]
+        return x
+    }
+
+    private func magnitude(_ z: DemucsComplexSpectrogram) -> MLXArray {
+        if config.cac {
+            let b = z.real.dim(0)
+            let c = z.real.dim(1)
+            let f = z.real.dim(2)
+            let t = z.real.dim(3)
+            return stacked([z.real, z.imag], axis: 2).reshaped([b, c * 2, f, t])
+        }
+        return sqrt(z.real * z.real + z.imag * z.imag)
+    }
+
+    private func mask(_ z: DemucsComplexSpectrogram, m: MLXArray) -> DemucsComplexSpectrogram {
+        if config.cac {
+            let b = m.dim(0)
+            let s = m.dim(1)
+            let f = m.dim(3)
+            let t = m.dim(4)
+            let ri = m.reshaped([b, s, -1, 2, f, t]).transposed(0, 1, 2, 4, 5, 3)
+            let parts = split(ri, parts: 2, axis: 5)
+            return DemucsComplexSpectrogram(
+                real: parts[0].squeezed(axis: 5),
+                imag: parts[1].squeezed(axis: 5)
+            )
+        }
+        return DemucsComplexSpectrogram(real: z.real, imag: z.imag)
+    }
+
+    // MARK: - Forward Pass
+
+    func callAsFunction(_ mix: MLXArray) -> MLXArray {
+        let originalLength = mix.dim(-1)
+
+        // Spectral analysis
+        let z = spec(mix)
+        var x = magnitude(z)
+
+        let b = x.dim(0)
+        let fq = x.dim(2)
+        let tSpec = x.dim(3)
+
+        // Normalize frequency domain
+        let meanF = mean(x, axes: [1, 2, 3], keepDims: true)
+        let stdF = std(x, axes: [1, 2, 3], keepDims: true)
+        x = (x - meanF) / (MLXArray(1e-5) + stdF)
+
+        // Normalize time domain
+        var xt = mix
+        var meant = MLXArray(0.0)
+        var stdt = MLXArray(1.0)
+        if config.hybrid {
+            meant = mean(xt, axes: [1, 2], keepDims: true)
+            stdt = std(xt, axes: [1, 2], keepDims: true)
+            xt = (xt - meant) / (MLXArray(1e-5) + stdt)
+        }
+
+        var saved: [MLXArray] = []
+        var savedT: [MLXArray] = []
+        var lengths: [Int] = []
+        var lengthsT: [Int] = []
+
+        // Encoder
+        for idx in 0..<encoder.count {
+            lengths.append(x.dim(-1))
+
+            var inject: MLXArray? = nil
+            if config.hybrid && idx < tencoder.count {
+                lengthsT.append(xt.dim(-1))
+                let tenc = tencoder[idx]
+                xt = tenc(xt, inject: nil)
+                if !tenc.empty {
+                    savedT.append(xt)
+                } else {
+                    inject = xt
+                }
+            }
+
+            x = encoder[idx](x, inject: inject)
+
+            if idx == 0, let freqEmbMod = freqEmb {
+                let frs = MLXArray(0..<x.dim(-2)).asType(.int32)
+                var emb = freqEmbMod(frs).transposed(1, 0)
+                emb = emb.expandedDimensions(axis: 0)
+                emb = emb.expandedDimensions(axis: 3)
+                x = x + MLXArray(freqEmbScale) * emb
+            }
+
+            saved.append(x)
+        }
+
+        // Bottleneck: zero-initialized (key difference from HTDemucs)
+        x = MLXArray.zeros(like: x)
+        if config.hybrid {
+            xt = MLXArray.zeros(like: xt)
+        }
+
+        // Decoder
+        let offset = config.depth - tdecoder.count
+        for idx in 0..<decoder.count {
+            let skip = saved.removeLast()
+            let length = lengths.removeLast()
+            let decoded = decoder[idx](x, skip: skip, length: length)
+            x = decoded.0
+            let pre = decoded.1
+
+            if config.hybrid && idx >= offset {
+                let tdec = tdecoder[idx - offset]
+                let lengthT = lengthsT.removeLast()
+
+                if tdec.empty {
+                    // Collapse freq dimension for empty time decoder
+                    let preFlat = pre[0..., 0..., 0, 0...]
+                    let tdecoded = tdec(preFlat, skip: MLXArray.zeros([1]), length: lengthT)
+                    xt = tdecoded.0
+                } else {
+                    let skipT = savedT.removeLast()
+                    let tdecoded = tdec(xt, skip: skipT, length: lengthT)
+                    xt = tdecoded.0
+                }
+            }
+        }
+
+        // Reshape and denormalize frequency output
+        let s = config.sources.count
+        x = x.reshaped([b, s, -1, fq, tSpec])
+        x = x * stdF.expandedDimensions(axis: 1) + meanF.expandedDimensions(axis: 1)
+
+        // Apply mask and convert back to waveform
+        let zout = mask(z, m: x)
+        var xWave = ispec(zout, length: originalLength)
+
+        // Combine with time domain
+        if config.hybrid {
+            let actualLength = xt.dim(-1)
+            xt = xt.reshaped([b, s, -1, actualLength])
+            xt = xt * stdt.expandedDimensions(axis: 1) + meant.expandedDimensions(axis: 1)
+
+            // Align lengths
+            if xWave.dim(-1) != xt.dim(-1) {
+                if xWave.dim(-1) > xt.dim(-1) {
+                    xWave = demucsCenterTrim(xWave, referenceLength: xt.dim(-1))
+                } else {
+                    xt = demucsCenterTrim(xt, referenceLength: xWave.dim(-1))
+                }
+            }
+            xWave = xt + xWave
+        }
+
+        return xWave
+    }
+}

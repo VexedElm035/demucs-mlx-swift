@@ -1,0 +1,3 @@
+import DemucsCLILib
+
+DemucsCLI.main()
