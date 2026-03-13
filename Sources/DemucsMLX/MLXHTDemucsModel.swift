@@ -190,22 +190,27 @@ final class HTDemucsGraph: Module {
             scale: config.embScale
         )
 
-        var crossDim = transformerChannels
+        // When bottom_channels > 0, create channel up/downsamplers to reduce
+        // dimensionality before the transformer. When bottom_channels == 0,
+        // the transformer operates directly on transformerChannels (matching
+        // the original Python Demucs behavior).
+        let transformerDim: Int
         if config.bottomChannels > 0 {
             self._channelUpsampler.wrappedValue = Conv1dNCL(transformerChannels, config.bottomChannels, kernelSize: 1)
             self._channelDownsampler.wrappedValue = Conv1dNCL(config.bottomChannels, transformerChannels, kernelSize: 1)
             self._channelUpsamplerT.wrappedValue = Conv1dNCL(transformerChannels, config.bottomChannels, kernelSize: 1)
             self._channelDownsamplerT.wrappedValue = Conv1dNCL(config.bottomChannels, transformerChannels, kernelSize: 1)
-            crossDim = config.bottomChannels
+            transformerDim = config.bottomChannels
         } else {
             self._channelUpsampler.wrappedValue = nil
             self._channelDownsampler.wrappedValue = nil
             self._channelUpsamplerT.wrappedValue = nil
             self._channelDownsamplerT.wrappedValue = nil
+            transformerDim = transformerChannels
         }
 
         self._crosstransformer.wrappedValue = CrossTransformerEncoder(
-            dim: crossDim,
+            dim: transformerDim,
             hiddenScale: config.tHiddenScale,
             numHeads: config.tHeads,
             numLayers: config.tLayers,
@@ -530,25 +535,26 @@ final class HTDemucsGraph: Module {
 
         if config.tLayers > 0 {
             let tMonitor = monitor?.scoped(start: step / totalSteps, end: (step + Float(config.tLayers)) / totalSteps)
-            if config.bottomChannels > 0 {
+            if config.bottomChannels > 0, let channelUpsampler, let channelDownsampler,
+               let channelUpsamplerT, let channelDownsamplerT {
                 let b = x.dim(0)
                 let c = x.dim(1)
                 let f = x.dim(2)
                 let t = x.dim(3)
 
                 x = x.reshaped([b, c, f * t])
-                x = channelUpsampler!(x)
+                x = channelUpsampler(x)
                 x = x.reshaped([b, config.bottomChannels, f, t])
-                xt = channelUpsamplerT!(xt)
+                xt = channelUpsamplerT(xt)
 
                 let out = try crosstransformer.forward(x, xt, monitor: tMonitor)
                 x = out.0
                 xt = out.1
 
                 x = x.reshaped([b, config.bottomChannels, f * t])
-                x = channelDownsampler!(x)
+                x = channelDownsampler(x)
                 x = x.reshaped([b, c, f, t])
-                xt = channelDownsamplerT!(xt)
+                xt = channelDownsamplerT(xt)
             }
             else {
                 let out = try crosstransformer.forward(x, xt, monitor: tMonitor)
