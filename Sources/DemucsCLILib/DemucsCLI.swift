@@ -126,12 +126,16 @@ public struct DemucsCLI: ParsableCommand {
 
             let start = CFAbsoluteTimeGetCurrent()
 
+            // Only include input audio in result when two-stem mode needs it
+            // to compute the complement (saves memory for normal 4/6-stem mode).
+            let needsInput = twoStems != nil
+
             let result: DemucsSeparationResult
             if useAsync || cancelAfter != nil {
-                result = try Self.separateAsync(separator: separator, inputURL: inputURL, cancelAfterSeconds: cancelAfter)
+                result = try Self.separateAsync(separator: separator, inputURL: inputURL, includeInput: needsInput, cancelAfterSeconds: cancelAfter)
             }
             else {
-                result = try separator.separate(fileAt: inputURL)
+                result = try separator.separate(fileAt: inputURL, includeInput: needsInput)
             }
 
             let elapsed = CFAbsoluteTimeGetCurrent() - start
@@ -142,11 +146,12 @@ public struct DemucsCLI: ParsableCommand {
 
             if let stem = twoStems {
                 // Two-stem mode: write the selected stem and its complement
-                guard let selectedAudio = result.stems[stem]
+                guard let selectedAudio = result.stems[stem],
+                      let inputAudio = result.input
                 else { continue }
 
                 // Compute the complement: original mix minus the selected stem
-                let mixSamples = result.input.channelMajorSamples
+                let mixSamples = inputAudio.channelMajorSamples
                 let stemSamples = selectedAudio.channelMajorSamples
                 var complementSamples = [Float](repeating: 0, count: mixSamples.count)
                 for i in 0 ..< mixSamples.count {
@@ -250,7 +255,7 @@ public struct DemucsCLI: ParsableCommand {
 
     /// Use the closure-based async API with progress reporting.
     /// Blocks the calling thread until the separation completes.
-    private static func separateAsync(separator: DemucsSeparator, inputURL: URL, cancelAfterSeconds: Double? = nil) throws -> DemucsSeparationResult {
+    private static func separateAsync(separator: DemucsSeparator, inputURL: URL, includeInput: Bool = false, cancelAfterSeconds: Double? = nil) throws -> DemucsSeparationResult {
         let semaphore = DispatchSemaphore(value: 0)
         let state = AsyncState()
         let cancelToken = DemucsCancelToken()
@@ -267,6 +272,7 @@ public struct DemucsCLI: ParsableCommand {
         separator.separate(
             fileAt: inputURL,
             cancelToken: cancelToken,
+            includeInput: includeInput,
             progress: { progress in
                 // Called on main queue - print progress
                 let percent = Int(progress.fraction * 100)

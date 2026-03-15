@@ -582,6 +582,7 @@ final class HDemucsGraph: Module {
                     xt = tdecoded.0
                 }
             }
+            MLX.eval(x)
             step += 1
         }
 

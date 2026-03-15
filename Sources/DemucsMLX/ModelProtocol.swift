@@ -62,7 +62,7 @@ enum DemucsModelFactory {
         // Per-model config with kwargs
         let modelConfigs = config["model_configs"] as? [[String: Any]]
 
-        let allWeights = try ModelLoader.loadWeights(from: directory, modelName: descriptor.name)
+        var allWeights = try ModelLoader.loadWeights(from: directory, modelName: descriptor.name)
 
         var subModels: [StemSeparationModel] = []
         var weightVectors: [[Float]] = []
@@ -71,10 +71,16 @@ enum DemucsModelFactory {
             let prefix = "model_\(i)."
             var subWeights: [String: MLXArray] = [:]
             subWeights.reserveCapacity(allWeights.count / numModels)
+            var keysToRemove: [String] = []
             for (key, value) in allWeights {
                 if key.hasPrefix(prefix) {
                     subWeights[String(key.dropFirst(prefix.count))] = value
+                    keysToRemove.append(key)
                 }
+            }
+            // Release consumed weights from the shared dict to free memory
+            for key in keysToRemove {
+                allWeights.removeValue(forKey: key)
             }
 
             // Determine model class for this sub-model

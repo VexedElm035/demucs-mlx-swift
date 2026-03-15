@@ -48,7 +48,9 @@ extension DemucsAudio {
 #endif
 
 public struct DemucsSeparationResult: Sendable {
-    public let input: DemucsAudio
+    /// The normalized input audio used for separation.
+    /// Only populated when `includeInput` is true (default: false) to save memory.
+    public let input: DemucsAudio?
     public let stems: [String: DemucsAudio]
 }
 
