@@ -90,6 +90,9 @@ separator.separate(
         // Called on main queue
         switch result {
         case .success(let separation):
+    }
+
+    CLI tip: if you're measuring memory with `/usr/bin/time -l`, make sure environment variables are applied to the process. These are correct:
             for (source, audio) in separation.stems {
                 try? AudioIO.writeAudio(audio, to: outputDir.appendingPathComponent("\(source).wav"))
             }
@@ -98,6 +101,25 @@ separator.separate(
         }
     }
 )
+        ```
+
+        Note: `time -l` reports both `maximum resident set size` (RSS) and `peak memory footprint`. On Apple Silicon, the footprint can be much larger because it includes Metal/MLX allocations and cache (unified memory), even if RSS looks relatively small.
+
+        You can also control MLX caching directly from the CLI:
+
+        ```bash
+        # Limit MLX cache to 2 MB ("2" is treated as MB)
+        /usr/bin/time -l .build/release/demucs-mlx-swift song.mp3 --model 2 --manifest --mlx-cache-limit 2
+
+        # Same limit, explicitly in bytes
+        /usr/bin/time -l .build/release/demucs-mlx-swift song.mp3 --model 2 --manifest --mlx-cache-limit 2097152
+
+        # Units are supported
+        /usr/bin/time -l .build/release/demucs-mlx-swift song.mp3 --model 2 --manifest --mlx-cache-limit 512k
+
+        # Clear MLX cache after each track
+        /usr/bin/time -l .build/release/demucs-mlx-swift song.mp3 --model 2 --manifest --mlx-clear-cache
+        ```
 
 // To cancel:
 cancelToken.cancel()
@@ -131,7 +153,7 @@ swift build -c release
 Run:
 
 ```bash
-.build/release/demucs-mlx-swift track.mp3 -o separated
+.build/release/demucs-mlx-swift test.mp3 --model 2 --manifest --mp3 --mp3-bitrate 320 --debug -o separated
 ```
 
 Options:
@@ -139,6 +161,7 @@ Options:
 | Option | Description |
 |--------|-------------|
 | `-n, --name` | Model name (default: `htdemucs`) |
+| `-m, --model` | Tier preset: 1=performance (`hdemucs_mmi`), 2=balanceado (`htdemucs`), 3=calidad (`mdx_extra_q`), 4=balanced_ft (`htdemucs_ft`), 5=6stems (`htdemucs_6s`) |
 | `-o, --out` | Output directory (default: `separated`) |
 | `--model-dir` | Local model directory |
 | `--segment` | Segment length in seconds |
@@ -150,7 +173,13 @@ Options:
 | `--two-stems` | Output one stem + complement (e.g. `vocals`) |
 | `--async` | Use async API with progress reporting |
 | `--list-models` | List available models |
+| `--cpu` | Force execution on CPU |
+| `--debug` | Print timing + RTF summary |
+| `--manifest` | Write stems into a unique run folder and generate `manifest.json` |
+| `--no-parallel-write` | Write stems sequentially instead of in parallel |
 | `--mp3` | Output as AAC in .m4a |
+| `--mp3-bitrate` | AAC bitrate in kbps when using `--mp3` (default: 320) |
+| `--wav` | Output as WAV (explicit; WAV is also the default when no codec flag is provided) |
 | `--flac` | Output as FLAC lossless |
 | `--alac` | Output as Apple Lossless in .m4a |
 | `--int24` | Output 24-bit integer WAV |
@@ -170,7 +199,14 @@ Examples:
 
 # Async with progress bar
 .build/release/demucs-mlx-swift song.mp3 --async -o out
+
+# Tier preset + structured output + manifest (creates a unique run folder)
+.build/release/demucs-mlx-swift song.mp3 --model 2 --manifest --mp3 --mp3-bitrate 320 -o separated
 ```
+
+When using `--manifest`, output goes to:
+
+`<out>/<track>_<timestamp>_<id8>/` with stem files named `<separation_id>_<stem>.<ext>` and a `manifest.json` containing SHA-256 hashes and metadata.
 
 ## Performance Tuning
 
